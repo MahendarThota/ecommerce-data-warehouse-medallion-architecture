@@ -1,0 +1,376 @@
+
+
+
+ECOMMERCE DATA WAREHOUSE
+Pipeline Design Documentation
+Olist Brazilian E-Commerce Dataset
+SQL Server Medallion Architecture | MS SQL Server 2019+
+
+
+
+1. Project Overview
+This project implements a production-grade Data Warehouse for the Olist Brazilian E-Commerce dataset using Microsoft SQL Server. The pipeline follows the Medallion Architecture pattern, processing raw CSV data through four layers before delivering clean, analytics-ready data to Power BI dashboards.
+
+1.1 Dataset
+Source: Olist Brazilian E-Commerce Public Dataset (Kaggle)
+
+CSV File	Rows	Description
+olist_customers_dataset.csv	99,441	Customer demographics and location
+olist_orders_dataset.csv	99,441	Order lifecycle with timestamps
+olist_order_items_dataset.csv	101,658	Line items: product, price, freight
+olist_products_dataset.csv	32,951	Product catalog with dimensions
+olist_order_payments_dataset.csv	103,886	Payment methods and values
+TOTAL	437,377	Rows across all source files
+
+1.2 Technology Stack
+•	Database: Microsoft SQL Server 2019+
+•	Pipeline: T-SQL Stored Procedures (modular design)
+•	Reporting: Power BI Desktop
+•	Architecture: Medallion (Source → Bronze → Silver → Gold)
+
+ 
+2. Architecture — Medallion Pattern
+The pipeline uses the Medallion Architecture, an industry-standard pattern where data passes through progressive layers, each adding quality and structure. Every layer has a clear responsibility and no layer skips or duplicates another's job.
+
+Layer	Schema	Responsibility	Load Strategy
+Source	source.*	Raw CSV ingestion via BULK INSERT	Always snapshot (TRUNCATE + reload)
+Bronze	bronze.*	Raw copy + ingestion metadata	Incremental via NOT EXISTS / watermark
+Silver	silver.*	Type casting, cleaning, DQ flags	Incremental via MERGE + watermark
+Gold	gold.*	Star schema for Power BI reporting	Incremental or snapshot
+Control	control.*	Watermarks + pipeline run logs	Managed by pipeline automatically
+
+2.1 Data Flow
+CSV Files
+    |
+    v  BULK INSERT (always snapshot)
+source.* tables  (all VARCHAR, raw)
+    |
+    v  NOT EXISTS / watermark filter
+bronze.* tables  (raw + ingestion_timestamp + source_system)
+    |
+    v  MERGE + ROW_NUMBER dedup + DQ flags
+silver.*_clean tables  (typed, cleaned, flagged)
+    |
+    v  Star schema load
+gold.dim_* + gold.fact_*  (Power BI ready)
+    |
+    v  Views
+gold.sales_summary, product_performance, customer_revenue, delivery_quality
+
+ 
+3. Control Layer
+The control schema manages pipeline state and history. It contains two tables that enable incremental loading and full audit trails.
+
+3.1 pipeline_watermark
+Stores the last successful run time for each module. NULL means never run — first run loads all data automatically without requiring a separate snapshot command.
+
+Column	Type	Purpose
+pipeline_name	VARCHAR(100)	Module identifier e.g. 'bronze_customers'
+last_load_time	DATETIME2	NULL = never run. Has value = last run time
+updated_at	DATETIME2	Auto-updated on each successful run
+
+14 watermarks are seeded as NULL at setup — one per module:
+•	bronze_customers, bronze_orders, bronze_order_items, bronze_products, bronze_payments
+•	silver_customers, silver_orders, silver_order_items, silver_products, silver_payments
+•	gold_dim_customers, gold_dim_products, gold_fact_sales, gold_fact_orders
+
+3.2 pipeline_log
+Every pipeline execution is logged with start time, end time, status, rows processed, and error messages. This enables full audit trails and debugging.
+
+Column	Type	Purpose
+pipeline_name	VARCHAR(100)	Module or pipeline name
+status	VARCHAR(20)	RUNNING → SUCCESS or FAILED
+rows_processed	INT	Rows affected in THIS run (not total in table)
+duration_seconds	INT	end_time minus start_time in seconds
+error_message	NVARCHAR(2000)	Populated only on FAILED status
+
+ 
+4. Source Layer
+The source layer is the entry point for all data. CSV files are loaded into source tables using BULK INSERT — the fastest method for CSV ingestion in SQL Server. No transformation is applied here.
+
+4.1 Design Decisions
+•	All columns are VARCHAR — no type conversion at this layer
+•	Always snapshot: TRUNCATE TABLE then BULK INSERT on every run
+•	No watermark needed — source is always a complete reload of the CSV
+•	Dates stored as raw strings e.g. '02-10-2017 10:56' — converted in Silver
+
+4.2 BULK INSERT Configuration
+BULK INSERT source.orders
+FROM 'D:\datasets\olist_orders_dataset.csv'
+WITH (
+    FIRSTROW=2,           -- skip header row
+    FIELDTERMINATOR=',',  -- comma separated
+    ROWTERMINATOR='\n',   -- newline row separator
+    TABLOCK               -- table lock for faster load
+)
+
+4.3 Stored Procedures
+•	source.load_customers — loads olist_customers_dataset.csv
+•	source.load_orders — loads olist_orders_dataset.csv
+•	source.load_order_items — loads olist_order_items_dataset.csv
+•	source.load_products — loads olist_products_dataset.csv
+•	source.load_payments — loads olist_order_payments_dataset.csv
+•	source.load_source — master procedure, calls all 5 modules
+
+ 
+5. Bronze Layer
+The bronze layer is a raw copy of source data with added metadata columns. It preserves data exactly as received while adding traceability information needed for incremental loading.
+
+5.1 Added Columns
+Column	Value	Purpose
+ingestion_timestamp	GETDATE()	When this row entered bronze — used as watermark
+source_system	'olist_csv'	Where data came from — supports multi-source future
+
+5.2 Incremental Load Strategy
+Each table uses a different strategy based on available timestamp information:
+
+Table	Strategy	Reason
+orders	NOT EXISTS check	Prevents duplicate order_ids across source reloads
+order_items	NOT EXISTS check	Composite PK: order_id + order_item_id
+payments	NOT EXISTS check	Composite PK: order_id + payment_sequential
+customers	NOT EXISTS check	No timestamp in source — key-based dedup
+products	NOT EXISTS check	No timestamp in source — key-based dedup
+
+5.3 Why NOT EXISTS Instead of Timestamp Comparison
+An earlier design used order_purchase_timestamp > watermark for orders. This was identified as incorrect because:
+•	Watermark stores pipeline run time (2026) not order creation time (2016-2018)
+•	Backdated orders common in real systems would be missed entirely
+•	NOT EXISTS correctly identifies truly new rows regardless of business date
+
+ 
+6. Silver Layer
+The silver layer is where real data engineering happens. Raw VARCHAR data is transformed into typed, cleaned, and quality-flagged records. No data is deleted — issues are flagged for downstream handling.
+
+6.1 Data Profiling Findings
+Before building silver, actual CSV data was profiled to make evidence-based decisions:
+
+Finding	Count	Decision
+Date format: DD-MM-YYYY HH:MM	All dates	TRY_CONVERT(..., 105) — not TRY_CAST
+order_approved_at NULL	160 rows	Valid business NULL — column is nullable
+order_delivered_carrier_date NULL	1,783 rows	Valid — not yet shipped orders
+order_delivered_customer_date NULL	2,965 rows	Valid — not yet delivered orders
+Carrier date < Approved date	1,358 rows	System recording lag — flagged not deleted
+DELIVERED but no delivery date	8 rows	Scan missed in system — flagged
+Products missing category	610 rows	Product exists but no category — flagged
+zip_code_prefix numeric	All rows	Safe to cast to INT
+freight_value = 0	348 rows	Free shipping — valid, flagged as is_free_shipping
+payment_type = 'not_defined'	3 rows	Keep and flag — not deleted
+
+6.2 Transformation Rules
+•	Empty strings: NULLIF(TRIM(col), '') converts empty string to NULL
+•	Dates: TRY_CONVERT(DATETIME2, NULLIF(TRIM(col),''), 105) — format code 105 = DD-MM-YYYY
+•	City names: Title-case applied (lowercase source data e.g. 'sao paulo' → 'Sao paulo')
+•	Order status: UPPER(TRIM()) standardised to uppercase
+•	Payment type: LOWER(TRIM()) standardised to lowercase
+•	zip_code_prefix: TRY_CAST to INT — confirmed all numeric in profiling
+
+6.3 ROW_NUMBER Deduplication
+Every silver MERGE uses ROW_NUMBER() to prevent primary key violations when source reloads create multiple bronze rows for the same key:
+ROW_NUMBER() OVER (
+    PARTITION BY TRIM(customer_id)
+    ORDER BY ingestion_timestamp DESC
+) AS rn
+-- WHERE rn = 1 -- take latest record only
+
+Without this, repeated source loads would cause 'Violation of PRIMARY KEY constraint' errors in the MERGE statement.
+
+6.4 Data Quality Flags — orders_clean
+No data is deleted in silver. Instead, DQ flags track issues for downstream handling in Gold and Power BI:
+
+Flag	Rows	Meaning
+is_delivery_inconsistent	8	Status=DELIVERED but no customer delivery date
+is_shipped_missing	2	Status=SHIPPED/DELIVERED but no carrier date
+is_canceled_in_transit	~75	CANCELED but carrier date present — returned
+is_canceled_but_reached	~6	CANCELED but delivery date present — reached customer
+is_invalid_date_sequence	1,358	Carrier date before approved — system recording lag
+is_late_delivery	varies	Actual delivery date after estimated delivery date
+
+6.5 DQ Flags — Other Tables
+Table	Flag	Meaning
+products_clean	is_missing_category	610 products: category, name_len, desc_len all NULL together
+products_clean	is_missing_dimensions	2 products: weight and dimensions are NULL
+order_items_clean	is_free_shipping	freight_value = 0 — valid free shipping, not an error
+payments_clean	is_not_defined	payment_type = 'not_defined' — 3 rows kept and flagged
+payments_clean	is_zero_value	payment_value = 0 — 9 voucher rows, valid
+
+6.6 MERGE Pattern
+Silver uses MERGE (upsert) for all tables — insert new rows, update changed rows, never delete:
+MERGE silver.customers_clean AS target
+USING (source query with ROW_NUMBER dedup) AS source
+ON target.customer_id = source.customer_id
+WHEN MATCHED THEN UPDATE SET ...  -- update changed data
+WHEN NOT MATCHED THEN INSERT .... -- insert new rows
+-- WHEN MATCHED AND SOURCE NOT IN TARGET = no delete in silver
+
+ 
+7. Gold Layer
+The gold layer implements a Star Schema optimised for Power BI reporting. It contains dimension tables, fact tables, and four pre-built views for common analytical queries.
+
+7.1 Star Schema Design
+Table	Type	Description
+gold.dim_customers	Dimension	Customer details — city, state, zip code
+gold.dim_products	Dimension	Product details — category, dimensions, volume
+gold.dim_date	Dimension	Date hierarchy 2016-2020 — year, quarter, month, weekend
+gold.fact_sales	Fact	Line item grain — price, freight, payment per item
+gold.fact_orders	Fact	Order grain — totals, DQ flags, delivery status
+
+7.2 No Foreign Key Constraints — Design Decision
+Foreign key constraints are intentionally omitted from the Gold layer. This is the industry standard in production Data Warehouses for the following reasons:
+•	Performance: Every INSERT would validate FK references row-by-row — significantly slower at scale
+•	Pipeline flexibility: TRUNCATE TABLE is blocked when FK constraints reference the table — snapshot reloads would fail
+•	Maintenance: Schema changes require dropping and recreating FK relationships
+•	Industry standard: Snowflake, Azure Synapse, and BigQuery all recommend FK NOT ENFORCED or no FK in warehouse layers
+
+Data integrity is enforced in the Silver layer via DQ flags and MERGE logic — not at the database constraint level.
+
+7.3 dim_date — Manually Generated
+The dim_date table is generated by a T-SQL WHILE loop, not sourced from CSV data. It covers 2016-01-01 to 2020-12-31 to accommodate all order dates (2016-2018) plus a buffer for estimated delivery dates.
+-- Generates 1,827 rows (5 years of daily dates)
+DECLARE @d DATE = '2016-01-01';
+WHILE @d <= '2020-12-31'
+BEGIN
+    INSERT INTO gold.dim_date VALUES (date_key, year, quarter, month, ...);
+    SET @d = DATEADD(day, 1, @d);
+END
+
+date_key uses YYYYMMDD integer format (e.g. 20171002) for fast joins without string conversion.
+
+7.4 Power BI Views
+View	Purpose
+gold.sales_summary	Monthly revenue, order counts, delivery rates, late delivery % by month
+gold.product_performance	Revenue, units sold, avg price, revenue rank per product
+gold.customer_revenue	Lifetime value, repeat vs one-time, first/last order dates per customer
+gold.delivery_quality	DQ dashboard — inconsistent deliveries, invalid date sequences by month
+
+7.5 DQ Flag Handling in Gold Views
+Gold views apply DQ flag filters so metrics are accurate:
+•	delivered_orders: excludes is_delivery_inconsistent = 1 (8 rows with no delivery date)
+•	late_delivery_rate: excludes is_invalid_date_sequence = 1 (1,358 system lag rows)
+•	Revenue metrics: include all orders regardless of DQ flags — revenue is real even for flagged rows
+
+ 
+8. Pipeline Stored Procedures
+8.1 Modular Design
+The pipeline follows a modular design where each table has its own procedure. Master procedures orchestrate the modules. This allows individual tables to be re-run independently for debugging or recovery.
+
+Procedure	Description
+dbo.run_pipeline	Main entry point — calls all 4 layers in sequence
+source.load_source	Master source loader — calls 5 table modules
+bronze.load_bronze	Master bronze loader — calls 5 table modules
+silver.load_silver	Master silver loader — calls 5 table modules
+gold.load_gold	Master gold loader — calls 4 table modules
+bronze.load_customers (+ 4 more)	Individual table procedures with OUTPUT row count
+silver.load_customers (+ 4 more)	Individual MERGE procedures with DQ flag logic
+gold.load_dim_customers (+ 3 more)	Individual Gold dimension and fact procedures
+
+8.2 @load_type Parameter
+Every master procedure accepts @load_type with two values:
+
+Value	Behaviour	Use Case
+'incremental'	Watermark NULL = load all. Has value = new rows only	Every normal run — daily or on-demand
+'snapshot'	TRUNCATE tables then full reload	Recovery, schema changes, first-time setup
+
+8.3 OUTPUT Parameters for Accurate Row Counts
+Each module procedure uses an OUTPUT parameter to return the exact rows processed in the current run. The master procedure sums these to log accurate rows_processed — not the total rows in the table.
+EXEC bronze.load_customers   @load_type=@load_type, @rows_out=@rows_customers   OUTPUT;
+EXEC bronze.load_orders      @load_type=@load_type, @rows_out=@rows_orders      OUTPUT;
+-- ...
+SET @total_rows = @rows_customers + @rows_orders + @rows_order_items + ...;
+
+8.4 Error Handling Pattern
+All procedures use BEGIN TRY / BEGIN CATCH. On failure, the pipeline_log is updated to FAILED with the exact error message, and THROW re-raises the error to the caller.
+BEGIN TRY
+    INSERT INTO control.pipeline_log (...) VALUES (..., 'RUNNING', ...);
+    -- pipeline work
+    UPDATE control.pipeline_log SET status='SUCCESS' WHERE log_id=@log_id;
+END TRY
+BEGIN CATCH
+    UPDATE control.pipeline_log SET status='FAILED', error_message=ERROR_MESSAGE()
+    WHERE log_id=@log_id;
+    THROW;  -- re-raise so SSMS also sees the error
+END CATCH
+
+ 
+9. Running the Pipeline
+9.1 First-Time Setup
+Run scripts in this exact order:
+•	01_setup_schemas_control.sql — creates database, schemas, control tables, seeds watermarks
+•	02_source_layer.sql — creates source tables and BULK INSERT procedures
+•	03_bronze_layer.sql — creates bronze tables and incremental load procedures
+•	04_silver_layer.sql — creates silver tables and MERGE procedures with DQ flags
+•	05_gold_layer.sql — creates gold tables, dim_date, load procedures, and 4 views
+•	06_main_pipeline.sql — creates dbo.run_pipeline and executes snapshot run
+
+Script 06 automatically executes EXEC dbo.run_pipeline @load_type = 'snapshot' at the end.
+
+9.2 Subsequent Runs
+-- Normal incremental run (watermark handles first vs subsequent automatically):
+EXEC dbo.run_pipeline;
+
+-- Force full reload (recovery or after schema change):
+EXEC dbo.run_pipeline @load_type = 'snapshot';
+
+9.3 Monitoring
+-- Check last 10 pipeline runs:
+SELECT TOP 10 pipeline_name, load_type, status, rows_processed,
+              duration_seconds, error_message
+FROM control.pipeline_log
+ORDER BY log_id DESC;
+
+-- Check watermark status per module:
+SELECT pipeline_name, last_load_time,
+       DATEDIFF(hour, last_load_time, GETDATE()) AS hours_since_last_load
+FROM control.pipeline_watermark
+ORDER BY pipeline_name;
+
+-- Verify Gold row counts:
+SELECT COUNT(*) FROM gold.fact_sales;    -- expect ~101,658
+SELECT COUNT(*) FROM gold.fact_orders;   -- expect ~99,441
+SELECT COUNT(*) FROM gold.dim_customers; -- expect ~99,441
+SELECT COUNT(*) FROM gold.dim_products;  -- expect ~32,951
+
+ 
+10. Power BI Dashboard
+10.1 Connection
+•	Open Power BI Desktop
+•	Home → Get Data → SQL Server
+•	Server: localhost (or server name), Database: Ecommerce_DW, Mode: Import
+•	Select all gold.* tables and views
+
+10.2 Relationships (Manual — No FK)
+From	To	Cardinality
+fact_sales.customer_key	dim_customers.customer_key	Many to One
+fact_sales.product_key	dim_products.product_key	Many to One
+fact_sales.date_key	dim_date.date_key	Many to One
+fact_orders.customer_key	dim_customers.customer_key	Many to One
+fact_orders.date_key	dim_date.date_key	Many to One
+
+10.3 Dashboard Pages
+•	Page 1 — Sales Overview: Monthly revenue trend, order counts, payment type split
+•	Page 2 — Product Performance: Top products by revenue, category treemap, free shipping analysis
+•	Page 3 — Customer Insights: Lifetime value, repeat vs one-time customers, revenue by state
+•	Page 4 — Delivery Quality: Late delivery rate, DQ issues by month, canceled order analysis
+
+10.4 Views vs Tables in Power BI
+Gold views (sales_summary, product_performance, customer_revenue, delivery_quality) contain pre-aggregated data with DQ flag filters already applied. These can be loaded directly and used without additional DAX measures for summary-level analysis. Gold tables (fact_sales, fact_orders, dim_*) enable drill-down and custom DAX measures.
+
+ 
+Appendix — Schema Summary
+Silver Layer Tables
+Table	Rows	Primary Key
+silver.customers_clean	99,441	customer_id
+silver.orders_clean	99,441	order_id
+silver.order_items_clean	101,658	order_id + order_item_id (composite)
+silver.products_clean	32,951	product_id
+silver.payments_clean	103,886	order_id + payment_sequential (composite)
+
+Gold Layer Tables
+Table	Rows	Key Column
+gold.dim_customers	99,441	customer_key (IDENTITY PK), customer_id (UNIQUE)
+gold.dim_products	32,951	product_key (IDENTITY PK), product_id (UNIQUE)
+gold.dim_date	1,827	date_key INT (YYYYMMDD format)
+gold.fact_sales	~101,658	sales_key (IDENTITY PK)
+gold.fact_orders	~99,441	order_key (IDENTITY PK), order_id (UNIQUE)
+
+
+— End of Documentation —
